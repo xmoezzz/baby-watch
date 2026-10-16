@@ -1,0 +1,70 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: baby-watch-windows-x86_64
+          - name: macOS Apple Silicon
+            os: macos-15
+            target: aarch64-apple-darwin
+            artifact: baby-watch-macos-arm64
+          - name: macOS Intel
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            artifact: baby-watch-macos-x86_64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build and package macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: bash scripts/build-macos.sh ${{ matrix.target }}
+      - name: Build and package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build --locked --release --target ${{ matrix.target }}
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/baby-watch.exe dist/baby-watch.exe
+          Compress-Archive -Path dist/baby-watch.exe,README.md,LICENSE -DestinationPath dist/${{ matrix.artifact }}.zip -Force
+          $hash = (Get-FileHash dist/${{ matrix.artifact }}.zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  ${{ matrix.artifact }}.zip" | Set-Content dist/${{ matrix.artifact }}.sha256 -Encoding ascii
+      - name: Upload distributable
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 30
