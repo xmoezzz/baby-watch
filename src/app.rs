@@ -3,28 +3,28 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use chrono::{DateTime, Local, Utc};
 use crossbeam_channel::{Receiver, Sender};
 use eframe::egui::{
-    self, Align, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText, Stroke, Vec2,
+    self, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText, Stroke, Vec2,
 };
 
 use crate::{
     browser,
     image_cache::ImageCache,
-    model::{CatalogProduct, StoreSource, VariantState, WatchItem},
+    model::{CatalogProduct, PurchaseRule, StoreSource, VariantState, WatchItem},
     monitor::{CatalogChange, MonitorCommand, MonitorEvent},
     release::{self, CheckoutGate, ReleaseRule, ReleaseSchedule},
     shopify,
     storage::{self, BrowserChoice, PersistedState, Settings},
 };
 
-const BG: Color32 = Color32::from_rgb(248, 244, 246);
-const PANEL: Color32 = Color32::from_rgb(255, 252, 253);
-const INK: Color32 = Color32::from_rgb(55, 45, 51);
-const MUTED: Color32 = Color32::from_rgb(132, 116, 124);
-const ROSE: Color32 = Color32::from_rgb(177, 105, 135);
-const ROSE_SOFT: Color32 = Color32::from_rgb(242, 224, 232);
+const BG: Color32 = Color32::from_rgb(247, 245, 243);
+const PANEL: Color32 = Color32::WHITE;
+const INK: Color32 = Color32::from_rgb(55, 46, 58);
+const MUTED: Color32 = Color32::from_rgb(132, 123, 134);
+const ROSE: Color32 = Color32::from_rgb(151, 100, 125);
+const ROSE_SOFT: Color32 = Color32::from_rgb(243, 232, 237);
 const GREEN: Color32 = Color32::from_rgb(56, 139, 101);
 const RED: Color32 = Color32::from_rgb(181, 75, 82);
-const BORDER: Color32 = Color32::from_rgb(231, 218, 224);
+const BORDER: Color32 = Color32::from_rgb(232, 226, 230);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -667,327 +667,179 @@ impl BabyWatchApp {
         let Some(source) = self.active_region else {
             return;
         };
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.label(
-                    RichText::new("BABY WATCH")
-                        .font(FontId::proportional(22.0))
-                        .strong()
-                        .color(INK),
-                );
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(format!("{} · {}", source.region_label(), source.host()))
-                            .size(11.0)
-                            .color(MUTED),
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("BABY Watch").size(22.0).strong().color(INK));
+            ui.add_space(12.0);
+            chip(ui, source.region_label());
+            ui.label(RichText::new(source.host()).size(12.0).color(MUTED));
+            if self.catalog_loading {
+                ui.spinner();
+            }
+        });
+    }
+
+    fn sidebar(&mut self, ui: &mut egui::Ui) {
+        let source = self.active_region.expect("store selected");
+        egui::ScrollArea::vertical()
+            .id_salt("sidebar_scroll")
+            .show(ui, |ui| {
+                eyebrow(ui, "YOUR COLLECTION");
+                ui.add_space(12.0);
+                for (page, label) in [
+                    (Page::Catalog, "Catalog"),
+                    (Page::Watchlist, "Watchlist"),
+                    (Page::Release, "Friday releases"),
+                    (Page::Purchase, "Purchase setup"),
+                ] {
+                    if nav_button(ui, label, self.page == page).clicked() {
+                        self.page = page;
+                    }
+                    ui.add_space(4.0);
+                }
+                ui.add_space(26.0);
+                eyebrow(ui, "AT A GLANCE");
+                ui.add_space(10.0);
+                let watched = self
+                    .watch_items
+                    .iter()
+                    .filter(|w| w.source == source)
+                    .count();
+                let armed = self
+                    .armed_ids
+                    .iter()
+                    .filter(|id| {
+                        self.watch_items
+                            .iter()
+                            .any(|w| w.id == **id && w.source == source)
+                    })
+                    .count();
+                sidebar_count(ui, "Products", self.catalog.len());
+                sidebar_count(ui, "Watching", watched);
+                sidebar_count(ui, "Armed", armed);
+                ui.add_space(22.0);
+                let (label, color) = match self.login_status() {
+                    LoginStatus::Ready => ("Session confirmed", GREEN),
+                    LoginStatus::NeedsRecheck => ("Check your session", ROSE),
+                    LoginStatus::Unknown => ("Sign-in needed", MUTED),
+                };
+                ui.label(RichText::new(format!("● {label}")).size(12.0).color(color));
+                ui.add_space(22.0);
+                ui.collapsing("Preferences", |ui| {
+                    let old = self.settings.clone();
+                    ui.checkbox(&mut self.settings.catalog_monitor, "Monitor catalog");
+                    ui.checkbox(&mut self.settings.notifications, "Notifications");
+                    small_label(ui, "Catalog interval");
+                    ui.add(
+                        egui::Slider::new(&mut self.settings.poll_seconds, 30..=300).suffix(" s"),
                     );
-                    chip(ui, source.short_label());
+                    small_label(ui, "Armed interval");
+                    ui.add(
+                        egui::Slider::new(&mut self.settings.armed_poll_seconds, 5..=30)
+                            .suffix(" s"),
+                    );
+                    if old.catalog_monitor != self.settings.catalog_monitor
+                        || old.notifications != self.settings.notifications
+                        || old.poll_seconds != self.settings.poll_seconds
+                        || old.armed_poll_seconds != self.settings.armed_poll_seconds
+                    {
+                        self.persist();
+                        self.sync_monitor();
+                    }
                 });
-            });
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add_space(18.0);
+                if soft_button(ui, "Open store").clicked() {
+                    let _ =
+                        browser::open_url(self.settings.browser, &shopify::storefront_url(source));
+                }
                 if soft_button(ui, "Switch store").clicked() {
                     self.disarm_all();
                     self.active_region = None;
                     self.catalog.clear();
                     self.catalog_loading = false;
-                    self.catalog_error = None;
                     let _ = self
                         .command_tx
                         .send(MonitorCommand::SetCatalogEnabled(false));
                 }
-                if soft_button(ui, "Open store").clicked() {
-                    let _ =
-                        browser::open_url(self.settings.browser, &shopify::storefront_url(source));
-                }
-                if self.catalog_loading {
-                    ui.label(RichText::new("◌ syncing catalog").size(12.0).color(ROSE));
-                } else {
-                    let enabled = self
-                        .watch_items
-                        .iter()
-                        .filter(|w| w.source == source && w.enabled)
-                        .count();
-                    ui.label(
-                        RichText::new(format!(
-                            "● {enabled} focused · {} catalog",
-                            self.catalog.len()
-                        ))
-                        .size(12.0)
-                        .color(GREEN),
-                    );
-                }
+                ui.add_space(24.0);
+                small_label(ui, "BABY Watch  /  v0.7.1");
             });
-        });
-    }
-
-    fn sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(8.0);
-        ui.label(RichText::new("BROWSE").size(11.0).strong().color(MUTED));
-        ui.add_space(6.0);
-
-        if nav_button(ui, "Catalog", self.page == Page::Catalog).clicked() {
-            self.page = Page::Catalog;
-        }
-        if nav_button(ui, "Watchlist", self.page == Page::Watchlist).clicked() {
-            self.page = Page::Watchlist;
-        }
-        if nav_button(ui, "Friday releases", self.page == Page::Release).clicked() {
-            self.page = Page::Release;
-        }
-        if nav_button(ui, "Purchase setup", self.page == Page::Purchase).clicked() {
-            self.page = Page::Purchase;
-        }
-
-        ui.add_space(14.0);
-        ui.separator();
-        ui.add_space(12.0);
-        ui.label(RichText::new("STATUS").size(11.0).strong().color(MUTED));
-
-        let source = self.active_region.expect("region gate must run first");
-        let region_total = self
-            .watch_items
-            .iter()
-            .filter(|item| item.source == source)
-            .count();
-        let catalog_stock = self.catalog.iter().filter(|p| p.any_available()).count();
-        let focused_ready = self
-            .watch_items
-            .iter()
-            .filter(|item| item.source == source)
-            .filter(|i| i.runtime.any_matching_available(&i.variant_filter))
-            .count();
-        stat(
-            ui,
-            "Catalog",
-            self.catalog.len().to_string(),
-            "All store products",
-        );
-        stat(
-            ui,
-            "In stock",
-            catalog_stock.to_string(),
-            "At least one variant in stock",
-        );
-        stat(
-            ui,
-            "Focused",
-            format!("{focused_ready}/{region_total}"),
-            "Product watches",
-        );
-        let login_summary = match self.login_status() {
-            LoginStatus::Ready => "LOGIN READY",
-            LoginStatus::NeedsRecheck => "LOGIN NEEDS RECHECK",
-            LoginStatus::Unknown => "LOGIN UNKNOWN",
-        };
-        stat(
-            ui,
-            "Armed",
-            self.armed_ids
-                .iter()
-                .filter(|id| {
-                    self.watch_items
-                        .iter()
-                        .any(|item| item.id == **id && item.source == source)
-                })
-                .count()
-                .to_string(),
-            login_summary,
-        );
-
-        ui.add_space(10.0);
-        ui.separator();
-        ui.add_space(12.0);
-        ui.label(RichText::new("SETTINGS").size(11.0).strong().color(MUTED));
-
-        if ui
-            .checkbox(&mut self.settings.catalog_monitor, "Monitor catalog")
-            .changed()
-        {
-            self.persist();
-            let _ = self.command_tx.send(MonitorCommand::SetCatalogEnabled(
-                self.settings.catalog_monitor,
-            ));
-        }
-
-        let mut seconds = self.settings.poll_seconds as f32;
-        if ui
-            .add(
-                egui::Slider::new(&mut seconds, 30.0..=300.0)
-                    .text("Poll interval (s)")
-                    .logarithmic(true),
-            )
-            .changed()
-        {
-            self.settings.poll_seconds = (seconds.round() as u64).clamp(30, 300);
-            self.persist();
-            let _ = self
-                .command_tx
-                .send(MonitorCommand::SetInterval(self.settings.poll_seconds));
-        }
-        if ui
-            .checkbox(&mut self.settings.notifications, "Desktop notifications")
-            .changed()
-        {
-            self.persist();
-        }
-
-        let mut armed_seconds = self.settings.armed_poll_seconds as f32;
-        if ui
-            .add(egui::Slider::new(&mut armed_seconds, 5.0..=30.0).text("ARMED interval (s)"))
-            .changed()
-        {
-            self.settings.armed_poll_seconds = (armed_seconds.round() as u64).clamp(5, 30);
-            self.persist();
-            let _ = self.command_tx.send(MonitorCommand::SetArmedInterval(
-                self.settings.armed_poll_seconds,
-            ));
-        }
-
-        ui.add_space(12.0);
-        if ui
-            .add_sized(
-                [ui.available_width(), 34.0],
-                egui::Button::new("↻ Refresh catalog").corner_radius(9),
-            )
-            .clicked()
-        {
-            let _ = self.command_tx.send(MonitorCommand::RefreshCatalog);
-            self.check_region_now(source);
-        }
-
-        ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
-            ui.label(
-                RichText::new("v0.7.0 · Friday release")
-                    .size(10.5)
-                    .color(MUTED),
-            );
-            ui.label(
-                RichText::new("Catalog and variant stock monitor")
-                    .size(10.5)
-                    .color(MUTED),
-            );
-        });
     }
 
     fn catalog_page(&mut self, ui: &mut egui::Ui) {
-        Frame::new()
-            .fill(PANEL)
-            .stroke(Stroke::new(1.0_f32, BORDER))
-            .corner_radius(14)
-            .inner_margin(Margin::same(16))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new("Catalog").size(18.0).strong().color(INK));
-                        let source = self.active_region.expect("region gate must run first");
-                        let sub = if let Some(t) = self.catalog_last_checked {
-                            format!(
-                                "{} · Shopify catalog · Last synced {}",
-                                source.store_label(),
-                                t.format("%H:%M:%S")
-                            )
-                        } else {
-                            format!("{} · Waiting for first sync", source.store_label())
-                        };
-                        ui.label(RichText::new(sub).size(11.5).color(MUTED));
-                    });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.add(primary_button("↻ Refresh")).clicked() {
-                            let _ = self.command_tx.send(MonitorCommand::RefreshCatalog);
-                        }
-                    });
-                });
-
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    ui.add_sized(
-                        [ui.available_width() * 0.56, 36.0],
-                        egui::TextEdit::singleline(&mut self.catalog_search)
-                            .hint_text("Search title / B50JS240 / color / SKU"),
-                    );
-                    ui.checkbox(&mut self.catalog_stock_only, "In stock only");
-                    egui::ComboBox::from_id_salt("catalog_brand")
-                        .selected_text(match self.catalog_brand {
-                            BrandFilter::Baby => "BABY",
-                            BrandFilter::Pirates => "A/P",
-                            BrandFilter::All => "All brands",
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.catalog_brand, BrandFilter::Baby, "BABY");
-                            ui.selectable_value(
-                                &mut self.catalog_brand,
-                                BrandFilter::Pirates,
-                                "ALICE and the PIRATES",
-                            );
-                            ui.selectable_value(
-                                &mut self.catalog_brand,
-                                BrandFilter::All,
-                                "All brands",
-                            );
-                        });
-                });
-            });
-
-        ui.add_space(12.0);
-
-        if let Some(error) = &self.catalog_error {
-            Frame::new()
-                .fill(Color32::from_rgb(255, 246, 247))
-                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(235, 190, 194)))
-                .corner_radius(10)
-                .inner_margin(Margin::same(12))
-                .show(ui, |ui| {
-                    ui.label(RichText::new(error).size(11.5).color(RED));
-                });
-            ui.add_space(10.0);
-        }
-
-        let indices = self.filtered_catalog_indices();
-        let total = indices.len();
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format!("{total} products"))
-                    .size(11.0)
-                    .strong()
-                    .color(MUTED),
+        section_title(
+            ui,
+            "The collection",
+            "Browse pieces, follow your favorites, and watch for a restock.",
+        );
+        card().show(ui, |ui| {
+            form_field(
+                ui,
+                "Search the collection",
+                &mut self.catalog_search,
+                "Product name, code, color, or SKU",
             );
-            if self.settings.catalog_monitor {
-                chip(ui, "● Catalog monitoring active");
+            ui.add_space(10.0);
+            ui.horizontal_wrapped(|ui| {
+                for (brand, label) in [
+                    (BrandFilter::Baby, "BABY"),
+                    (BrandFilter::Pirates, "ALICE and the PIRATES"),
+                    (BrandFilter::All, "All brands"),
+                ] {
+                    if ui
+                        .selectable_label(self.catalog_brand == brand, label)
+                        .clicked()
+                    {
+                        self.catalog_brand = brand;
+                    }
+                }
+                ui.checkbox(&mut self.catalog_stock_only, "In stock only");
+                if soft_button(ui, "Refresh").clicked() {
+                    let _ = self.command_tx.send(MonitorCommand::RefreshCatalog);
+                }
+            });
+        });
+        ui.add_space(16.0);
+        if let Some(error) = &self.catalog_error {
+            notice(ui, error, RED);
+        }
+        let indices = self.filtered_catalog_indices();
+        ui.horizontal_wrapped(|ui| {
+            small_label(ui, &format!("{} pieces", indices.len()));
+            if let Some(at) = self.catalog_last_checked {
+                small_label(ui, &format!("Updated {}", at.format("%H:%M:%S")));
             }
         });
-        ui.add_space(7.0);
-
+        ui.add_space(12.0);
         if self.catalog.is_empty() {
-            Frame::new()
-                .fill(PANEL)
-                .stroke(Stroke::new(1.0_f32, BORDER))
-                .corner_radius(14)
-                .inner_margin(Margin::same(28))
-                .show(ui, |ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.label(RichText::new("♡").size(34.0).color(ROSE));
-                        ui.label(
-                            RichText::new(if self.catalog_loading {
-                                "Syncing the store catalog…"
-                            } else {
-                                "No product data yet"
-                            })
-                            .size(15.0)
-                            .strong()
-                            .color(INK),
-                        );
-                    });
-                });
+            empty_state(
+                ui,
+                if self.catalog_loading {
+                    "Curating your collection…"
+                } else {
+                    "Your collection will appear here"
+                },
+                "Refresh the catalog to load products from the selected store.",
+            );
             return;
         }
-
+        if indices.is_empty() {
+            empty_state(
+                ui,
+                "No pieces match this search",
+                "Try a different name, product code, or brand filter.",
+            );
+            return;
+        }
+        // Rows use their actual content height. No fixed-height virtualization
+        // or inherited column justification can make neighboring cards overlap.
         egui::ScrollArea::vertical()
+            .id_salt("catalog_scroll")
             .auto_shrink([false, false])
-            .show_rows(ui, 176.0, total, |ui, rows| {
-                for row in rows {
-                    let index = indices[row];
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                for index in indices {
                     self.catalog_row(ui, index);
-                    ui.add_space(6.0);
+                    ui.add_space(14.0);
                 }
             });
     }
@@ -1014,615 +866,288 @@ impl BabyWatchApp {
 
     fn catalog_row(&mut self, ui: &mut egui::Ui, index: usize) {
         let product = self.catalog[index].clone();
-        let thumbnail = product
-            .image_url
-            .as_deref()
-            .and_then(|url| self.image_cache.texture(url));
-        let colors = product.colors();
-        let available_colors = colors.iter().filter(|color| color.available).count();
-        let available_variants = product.available_variant_count();
-        let total_variants = product.variants.len();
-        let code = product.product_code.as_deref().unwrap_or("—");
-        let price = product
-            .min_price_minor()
-            .map(shopify::format_jpy)
-            .unwrap_or_else(|| "—".into());
-        let source = self.active_region.expect("region gate must run first");
-        let already_watched = self
+        let visible = ui.is_rect_visible(egui::Rect::from_min_size(
+            ui.next_widget_position(),
+            Vec2::new(ui.available_width(), 270.0),
+        ));
+        let thumbnail = if visible {
+            product
+                .image_url
+                .as_deref()
+                .and_then(|url| self.image_cache.texture(url))
+        } else {
+            None
+        };
+        let source = self.active_region.expect("store selected");
+        let watched = self
             .watch_items
             .iter()
             .any(|w| w.source == source && w.product_url == product.product_url);
-
-        Frame::new()
-            .fill(PANEL)
-            .stroke(Stroke::new(1.0_f32, BORDER))
-            .corner_radius(12)
-            .inner_margin(Margin::symmetric(12, 10))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    product_thumbnail(ui, thumbnail.as_ref(), 88.0);
-
-                    ui.add_space(2.0);
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new(&product.title).size(14.0).strong().color(INK));
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(RichText::new(code).size(10.5).monospace().color(MUTED));
-                            ui.label(RichText::new("·").size(10.5).color(MUTED));
-                            ui.label(RichText::new(&product.vendor).size(10.5).color(MUTED));
-                            if !product.product_type.is_empty() {
-                                ui.label(RichText::new("·").size(10.5).color(MUTED));
-                                ui.label(
-                                    RichText::new(&product.product_type).size(10.5).color(MUTED),
-                                );
-                            }
-                        });
-                        ui.add_space(5.0);
-                        ui.horizontal_wrapped(|ui| {
-                            chip(ui, &price);
-                            if !colors.is_empty() {
-                                chip(
-                                    ui,
-                                    &format!("{available_colors}/{} colors in stock", colors.len()),
-                                );
-                            } else {
-                                chip(
-                                    ui,
-                                    &format!(
-                                        "{available_variants}/{total_variants} variants in stock"
-                                    ),
-                                );
-                            }
-                            chip(
-                                ui,
-                                if product.any_available() {
-                                    "● AVAILABLE"
-                                } else {
-                                    "○ SOLD OUT"
-                                },
-                            );
-                        });
-
-                        if !colors.is_empty() {
-                            ui.add_space(5.0);
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label(RichText::new("Color").size(10.5).strong().color(MUTED));
-                                for color in &colors {
-                                    color_stock_chip(ui, &color.name, color.available);
-                                }
-                            });
-                        }
-                    });
-
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.add(primary_button("Open product")).clicked() {
-                            let _ = browser::open_url(self.settings.browser, &product.product_url);
-                        }
-                        let label = if already_watched {
-                            "Watching"
-                        } else {
-                            "＋ Watch product"
-                        };
-                        if ui
-                            .add_enabled(
-                                !already_watched,
-                                egui::Button::new(label).corner_radius(9),
-                            )
-                            .clicked()
-                        {
-                            let input = product
-                                .product_code
-                                .clone()
-                                .unwrap_or_else(|| product.title.clone());
-                            self.insert_watch(
-                                source,
-                                input,
-                                product.product_url.clone(),
-                                String::new(),
-                            );
-                            self.toast = Some(("Added to watchlist".into(), ui.input(|i| i.time)));
-                        }
-                    });
+        card().show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            let width = ui.available_width();
+            ui.horizontal_top(|ui| {
+                product_thumbnail(ui, thumbnail.as_ref(), 94.0);
+                ui.add_space(8.0);
+                ui.vertical(|ui| {
+                    ui.set_width((width - 120.0).max(100.0));
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&product.title).size(15.0).strong().color(INK),
+                        )
+                        .wrap(),
+                    );
+                    ui.add_space(6.0);
+                    small_label(
+                        ui,
+                        product.product_code.as_deref().unwrap_or(&product.vendor),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(
+                            product
+                                .min_price_minor()
+                                .map(shopify::format_jpy)
+                                .unwrap_or_else(|| "—".into()),
+                        )
+                        .size(17.0)
+                        .color(ROSE),
+                    );
                 });
             });
+            ui.add_space(12.0);
+            ui.horizontal_wrapped(|ui| {
+                let colors = product.colors();
+                if colors.is_empty() {
+                    chip(
+                        ui,
+                        if product.any_available() {
+                            "In stock"
+                        } else {
+                            "Sold out"
+                        },
+                    );
+                } else {
+                    for color in colors.iter().take(6) {
+                        color_stock_chip(ui, &color.name, color.available);
+                    }
+                    if colors.len() > 6 {
+                        small_label(ui, &format!("+{} colors", colors.len() - 6));
+                    }
+                }
+            });
+            ui.add_space(12.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(
+                        !watched,
+                        primary_button(if watched { "Watching" } else { "+ Watch" }),
+                    )
+                    .clicked()
+                {
+                    self.insert_watch(
+                        source,
+                        product
+                            .product_code
+                            .clone()
+                            .unwrap_or_else(|| product.title.clone()),
+                        product.product_url.clone(),
+                        String::new(),
+                    );
+                }
+                if soft_button(ui, "View product").clicked() {
+                    let _ = browser::open_url(self.settings.browser, &product.product_url);
+                }
+            });
+        });
     }
 
     fn watchlist_page(&mut self, ui: &mut egui::Ui) {
-        self.add_panel(ui);
-        ui.add_space(18.0);
         egui::ScrollArea::vertical()
+            .id_salt("watchlist_scroll")
             .auto_shrink([false, false])
-            .show(ui, |ui| self.watchlist(ui));
-    }
-
-    fn add_panel(&mut self, ui: &mut egui::Ui) {
-        Frame::new()
-            .fill(PANEL)
-            .stroke(Stroke::new(1.0_f32, BORDER))
-            .corner_radius(14)
-            .inner_margin(Margin::same(16))
             .show(ui, |ui| {
-                ui.label(
-                    RichText::new("Add a product watch")
-                        .size(16.0)
-                        .strong()
-                        .color(INK),
+                section_title(
+                    ui,
+                    "Your watchlist",
+                    "A little closer to the pieces you love.",
                 );
-                ui.label(
-                    RichText::new(format!(
-                        "{} · Watch a specific product, color, and size",
-                        self.active_region.expect("region gate").store_label()
-                    ))
-                    .size(11.5)
-                    .color(MUTED),
-                );
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    let available = ui.available_width();
-                    ui.add_sized(
-                        [available * 0.55, 36.0],
-                        egui::TextEdit::singleline(&mut self.add_input).hint_text(
-                            if self.active_region == Some(StoreSource::JapanOnlineStore) {
-                                "Product URL / code"
-                            } else {
-                                "LaceRococo product URL"
-                            },
-                        ),
+                card().show(ui, |ui| {
+                    ui.label(RichText::new("Add a piece").size(16.0).strong());
+                    ui.add_space(10.0);
+                    form_field(
+                        ui,
+                        "Product URL or code",
+                        &mut self.add_input,
+                        "Paste a store product link or Japan product code",
                     );
-                    ui.add_sized(
-                        [available * 0.27, 36.0],
-                        egui::TextEdit::singleline(&mut self.add_filter)
-                            .hint_text("Color: Pink | Black"),
+                    ui.add_space(8.0);
+                    form_field(
+                        ui,
+                        "Color preference (optional)",
+                        &mut self.add_filter,
+                        "Pink | Black",
                     );
-                    if ui
-                        .add_sized([available * 0.16, 36.0], primary_button("＋ Watch"))
-                        .clicked()
-                    {
+                    ui.add_space(10.0);
+                    if ui.add(primary_button("Add to watchlist")).clicked() {
                         self.add_watch();
                     }
+                    if let Some(error) = &self.add_error {
+                        notice(ui, error, RED);
+                    }
                 });
-                if let Some(error) = &self.add_error {
-                    ui.add_space(6.0);
-                    ui.label(RichText::new(error).size(11.0).color(RED));
-                }
+                ui.add_space(16.0);
+                self.watchlist(ui);
             });
     }
 
     fn watchlist(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("WATCHLIST").size(11.0).strong().color(MUTED));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(
-                    RichText::new(format!(
-                        "{} items",
-                        self.watch_items
-                            .iter()
-                            .filter(|item| Some(item.source) == self.active_region)
-                            .count()
-                    ))
-                    .size(11.0)
-                    .color(MUTED),
-                );
-            });
-        });
-        ui.add_space(7.0);
-
-        let source = self.active_region.expect("region gate must run first");
-        let region_item_count = self
+        let Some(source) = self.active_region else {
+            return;
+        };
+        let ids: Vec<_> = self
             .watch_items
             .iter()
-            .filter(|item| item.source == source)
-            .count();
-        if region_item_count == 0 {
-            Frame::new()
-                .fill(PANEL)
-                .stroke(Stroke::new(1.0_f32, BORDER))
-                .corner_radius(14)
-                .inner_margin(Margin::same(28))
-                .show(ui, |ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.label(RichText::new("♡").size(34.0).color(ROSE));
-                        ui.label(
-                            RichText::new("No product watches yet")
-                                .size(15.0)
-                                .strong()
-                                .color(INK),
-                        );
-                        ui.label(
-                            RichText::new(
-                                "Add a product from Catalog, or enter a product code above.",
-                            )
-                            .size(11.5)
-                            .color(MUTED),
-                        );
-                    });
-                });
+            .filter(|w| w.source == source)
+            .map(|w| w.id)
+            .collect();
+        if ids.is_empty() {
+            empty_state(
+                ui,
+                "Nothing on your watchlist yet",
+                "Choose a piece in Catalog, or add a product above.",
+            );
             return;
         }
-
-        let mut delete_id = None;
-        let mut needs_sync = false;
-        let ids = self
-            .watch_items
-            .iter()
-            .filter(|item| item.source == source)
-            .map(|x| x.id)
-            .collect::<Vec<_>>();
-
+        let mut sync = false;
+        let mut delete = None;
         for id in ids {
-            let Some(index) = self.watch_items.iter().position(|x| x.id == id) else {
+            let Some(index) = self.watch_items.iter().position(|w| w.id == id) else {
                 continue;
             };
-            let is_selected = self.selected_id == Some(id);
-            let thumbnail = self.watch_items[index]
-                .runtime
-                .image_url
-                .as_deref()
-                .and_then(|url| self.image_cache.texture(url));
-            let card = Frame::new()
-                .fill(if is_selected {
-                    Color32::from_rgb(255, 249, 252)
-                } else {
-                    PANEL
-                })
-                .stroke(Stroke::new(
-                    if is_selected { 1.5_f32 } else { 1.0_f32 },
-                    if is_selected { ROSE } else { BORDER },
-                ))
-                .corner_radius(14)
-                .inner_margin(Margin::same(15));
-
-            let is_armed = self.armed_ids.contains(&id);
-            let mut toggle_arm = false;
-            let mut open_checkout = false;
-
-            let response = card.show(ui, |ui| {
+            let armed = self.armed_ids.contains(&id);
+            let mut toggle = false;
+            let mut checkout = false;
+            let mut changed = false;
+            card().show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
                 let item = &mut self.watch_items[index];
-                let available = item.runtime.any_matching_available(&item.variant_filter);
-
-                ui.horizontal(|ui| {
-                    product_thumbnail(ui, thumbnail.as_ref(), 72.0);
-                    ui.add_space(2.0);
-
-                    let dot = if item.runtime.checking {
-                        "◌"
-                    } else if available {
-                        "●"
-                    } else if item.runtime.last_error.is_some() {
-                        "!"
-                    } else {
-                        "○"
-                    };
-                    let dot_color = if available {
-                        GREEN
-                    } else if item.runtime.last_error.is_some() {
-                        RED
-                    } else {
-                        MUTED
-                    };
-                    ui.label(RichText::new(dot).size(15.0).color(dot_color));
-
-                    ui.vertical(|ui| {
-                        let title = item.runtime.title.as_deref().unwrap_or(&item.input);
-                        ui.label(RichText::new(title).size(15.0).strong().color(INK));
-                        let code = item
-                            .runtime
-                            .product_code
-                            .as_deref()
-                            .unwrap_or("waiting for first check");
-                        ui.label(RichText::new(code).size(10.5).color(MUTED).monospace());
-                    });
-
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.small_button("×").on_hover_text("Delete watch").clicked() {
-                            delete_id = Some(item.id);
-                        }
-                        if ui
-                            .checkbox(&mut item.enabled, "")
-                            .on_hover_text("Enable / pause")
-                            .changed()
-                        {
-                            needs_sync = true;
-                        }
-                        let status = if is_armed {
-                            "ARMED"
-                        } else if item.runtime.checking {
-                            "CHECKING"
-                        } else if available {
-                            "AVAILABLE"
-                        } else if item.runtime.last_error.is_some() {
-                            "ERROR"
-                        } else {
-                            "WATCHING"
-                        };
-                        ui.label(
-                            RichText::new(status)
-                                .size(10.5)
-                                .strong()
-                                .color(if is_armed {
-                                    ROSE
-                                } else if available {
-                                    GREEN
-                                } else if item.runtime.last_error.is_some() {
-                                    RED
-                                } else {
-                                    MUTED
-                                }),
-                        );
-                    });
-                });
-
-                ui.add_space(9.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(item.runtime.title.as_deref().unwrap_or(&item.input))
+                            .size(18.0)
+                            .strong(),
+                    )
+                    .wrap(),
+                );
+                ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
                     chip(
                         ui,
-                        &format!(
-                            "filter  {}",
-                            if item.variant_filter.is_empty() {
-                                "All colors / variants"
-                            } else {
-                                &item.variant_filter
-                            }
-                        ),
-                    );
-                    if let Some(t) = item.runtime.last_checked {
-                        chip(ui, &format!("checked  {}", t.format("%H:%M:%S")));
-                    }
-                    if !item.runtime.variants.is_empty() {
-                        let colors = item.runtime.colors();
-                        if !colors.is_empty() {
-                            chip(ui, &format!("{} colors", colors.len()));
+                        if armed {
+                            "Armed"
+                        } else if item.runtime.checking {
+                            "Checking…"
                         } else {
-                            chip(
-                                ui,
-                                &format!("{} purchase specs", item.runtime.variants.len()),
-                            );
-                        }
+                            "Watching"
+                        },
+                    );
+                    if let Some(at) = item.runtime.last_checked {
+                        small_label(ui, &format!("Checked {}", at.format("%H:%M:%S")));
                     }
+                    changed |= ui.checkbox(&mut item.enabled, "Enabled").changed();
                 });
-
-                if !item.runtime.variants.is_empty() {
-                    let colors = item.runtime.colors();
-                    if !colors.is_empty() {
-                        ui.add_space(7.0);
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(RichText::new("Color").size(10.5).strong().color(MUTED));
-                            for color in &colors {
-                                color_stock_chip(ui, &color.name, color.available);
-                            }
-                        });
-                    }
-                }
-
-                if let Some(error) = &item.runtime.last_error {
-                    ui.add_space(8.0);
-                    ui.label(RichText::new(error).size(11.0).color(RED));
-                }
-
-                if !item.runtime.variants.is_empty() {
-                    ui.add_space(10.0);
-                    let selectable = item
-                        .runtime
-                        .selectable_variants(&item.variant_filter)
-                        .into_iter()
-                        .cloned()
-                        .collect::<Vec<_>>();
-
-                    if selectable.is_empty() {
-                        ui.label(
-                            RichText::new("No colors / variants match this filter")
-                                .size(11.0)
-                                .color(RED),
+                ui.add_space(16.0);
+                changed |= purchase_fields(ui, &mut item.variant_filter, &mut item.purchase);
+                ui.add_space(12.0);
+                small_label(ui, "Variant selection");
+                let label = item
+                    .runtime
+                    .selected_variant
+                    .and_then(|id| item.runtime.variants.iter().find(|v| v.id == id))
+                    .map(|v| v.display_label())
+                    .unwrap_or_else(|| "Automatic · follow your priorities".into());
+                egui::ComboBox::from_id_salt(("variant", id))
+                    .width(ui.available_width().min(480.0))
+                    .wrap_mode(egui::TextWrapMode::Truncate)
+                    .selected_text(label)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut item.runtime.selected_variant,
+                            None,
+                            "Automatic · follow your priorities",
                         );
-                    } else {
-                        let selected_text = item
-                            .runtime
-                            .selected_variant
-                            .and_then(|id| item.runtime.variants.iter().find(|v| v.id == id))
-                            .map(|v| {
-                                format!(
-                                    "{} · {}{}",
-                                    v.display_label(),
-                                    shopify::format_jpy(v.price_minor),
-                                    if v.available {
-                                        " · in stock"
-                                    } else {
-                                        " · sold out"
-                                    }
-                                )
-                            })
-                            .unwrap_or_else(|| "Select a color / variant".into());
-
-                        egui::ComboBox::from_id_salt(("variant", item.id))
-                            .selected_text(selected_text)
-                            .width(ui.available_width())
-                            .show_ui(ui, |ui| {
+                        for variant in &item.runtime.variants {
+                            if variant.matches_filter(&item.variant_filter) {
                                 ui.selectable_value(
                                     &mut item.runtime.selected_variant,
-                                    None,
-                                    "Choose automatically by color / size priority",
-                                );
-                                for v in &selectable {
-                                    let text = format!(
+                                    Some(variant.id),
+                                    format!(
                                         "{} · {}{}",
-                                        v.display_label(),
-                                        shopify::format_jpy(v.price_minor),
-                                        if v.available {
-                                            " · in stock"
+                                        variant.display_label(),
+                                        shopify::format_jpy(variant.price_minor),
+                                        if variant.available {
+                                            ""
                                         } else {
                                             " · sold out"
                                         }
-                                    );
-                                    ui.selectable_value(
-                                        &mut item.runtime.selected_variant,
-                                        Some(v.id),
-                                        text,
-                                    );
-                                }
-                            });
-                    }
-                }
-
-                ui.add_space(11.0);
-                Frame::new()
-                    .fill(Color32::from_rgb(252, 247, 249))
-                    .stroke(Stroke::new(1.0_f32, BORDER))
-                    .corner_radius(10)
-                    .inner_margin(Margin::symmetric(11, 9))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new("Purchase rules")
-                                    .size(11.0)
-                                    .strong()
-                                    .color(INK),
-                            );
-                            ui.label(
-                                RichText::new(if is_armed {
-                                    "● ARMED"
-                                } else {
-                                    "○ DISARMED"
-                                })
-                                .size(10.5)
-                                .strong()
-                                .color(if is_armed {
-                                    ROSE
-                                } else {
-                                    MUTED
-                                }),
-                            );
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.label(
-                                    RichText::new(
-                                        "Confirm the final order and payment on the store checkout",
-                                    )
-                                    .size(10.0)
-                                    .color(MUTED),
+                                    ),
                                 );
-                            });
-                        });
-                        ui.add_space(6.0);
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(RichText::new("Color priority").size(10.5).color(MUTED));
-                            let color_response = ui.add(
-                                egui::TextEdit::singleline(&mut item.variant_filter)
-                                    .hint_text("Example: Pink | Red | Black")
-                                    .desired_width(220.0),
-                            );
-                            if color_response.changed() {
-                                item.runtime.selected_variant = None;
-                                needs_sync = true;
                             }
-
-                            ui.separator();
-                            ui.label(RichText::new("Size priority").size(10.5).color(MUTED));
-                            let size_response = ui.add(
-                                egui::TextEdit::singleline(&mut item.purchase.size_priority)
-                                    .hint_text("Example: M | S")
-                                    .desired_width(140.0),
-                            );
-                            if size_response.changed() {
-                                item.runtime.selected_variant = None;
-                                needs_sync = true;
-                            }
-
-                            ui.separator();
-                            ui.label(RichText::new("Price ceiling").size(10.5).color(MUTED));
-                            let price_response = ui.add(
-                                egui::DragValue::new(&mut item.purchase.max_price_yen)
-                                    .range(0..=500_000)
-                                    .speed(1_000.0)
-                                    .prefix("¥"),
-                            );
-                            if price_response.changed() {
-                                needs_sync = true;
-                            }
-                            ui.label(RichText::new("0 = no limit").size(9.5).color(MUTED));
-                        });
-                        if ui
-                            .checkbox(
-                                &mut item.purchase.auto_open_checkout,
-                                "Open store checkout automatically on an ARMED match",
-                            )
-                            .changed()
-                        {
-                            needs_sync = true;
                         }
                     });
-
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    if soft_button(ui, "↻ Check").clicked() {
-                        let _ = self
-                            .command_tx
-                            .send(MonitorCommand::CheckNow(Some(item.id)));
+                if let Some(error) = &item.runtime.last_error {
+                    notice(ui, error, RED);
+                }
+                ui.add_space(16.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add(primary_button(if armed { "Disarm" } else { "Arm target" }))
+                        .clicked()
+                    {
+                        toggle = true;
                     }
-                    if soft_button(ui, "Open product").clicked() {
+                    if ui
+                        .add_enabled(
+                            Self::resolve_purchase_variant(item).is_some(),
+                            secondary_button("Open checkout"),
+                        )
+                        .clicked()
+                    {
+                        checkout = true;
+                    }
+                    if soft_button(ui, "Check now").clicked() {
+                        let _ = self.command_tx.send(MonitorCommand::CheckNow(Some(id)));
+                    }
+                    if soft_button(ui, "View product").clicked() {
                         let _ = browser::open_url(self.settings.browser, &item.product_url);
                     }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let buyable = Self::resolve_purchase_variant(item).is_some();
-                        let checkout_label = if buyable {
-                            "Open checkout →"
-                        } else {
-                            "Waiting for stock"
-                        };
-                        if ui
-                            .add_enabled(buyable, primary_button(checkout_label))
-                            .clicked()
-                        {
-                            open_checkout = true;
-                        }
-
-                        let arm_label = if is_armed { "Disarm" } else { "Arm target" };
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new(arm_label).strong().color(if is_armed {
-                                        RED
-                                    } else {
-                                        ROSE
-                                    }),
-                                )
-                                .fill(if is_armed { Color32::WHITE } else { ROSE_SOFT })
-                                .stroke(Stroke::new(1.0_f32, if is_armed { RED } else { ROSE }))
-                                .corner_radius(9)
-                                .min_size(Vec2::new(100.0, 34.0)),
-                            )
-                            .clicked()
-                        {
-                            toggle_arm = true;
-                        }
-                    });
+                    if soft_button(ui, "Remove").clicked() {
+                        delete = Some(id);
+                    }
                 });
             });
-
-            if response.response.clicked() {
-                self.selected_id = Some(id);
+            if changed {
+                sync = true;
             }
-            if open_checkout {
-                self.launch_checkout(id, "Manual checkout", false);
-            }
-            if toggle_arm {
-                if is_armed {
+            if toggle {
+                if armed {
                     self.disarm_target(id);
                 } else {
                     self.arm_target(id);
                 }
             }
-            ui.add_space(9.0);
-        }
-
-        if let Some(id) = delete_id {
-            self.disarm_target(id);
-            self.watch_items.retain(|x| x.id != id);
-            self.armed_ids.remove(&id);
-            self.checkout_gate.reset(id);
-            if self.selected_id == Some(id) {
-                self.selected_id = None;
+            if checkout {
+                self.launch_checkout(id, "Manual checkout", false);
             }
-            needs_sync = true;
+            ui.add_space(16.0);
         }
-        if needs_sync {
+        if let Some(id) = delete {
+            self.disarm_target(id);
+            self.watch_items.retain(|w| w.id != id);
+            sync = true;
+        }
+        if sync {
             self.persist();
             self.sync_monitor();
         }
@@ -1632,416 +1157,70 @@ impl BabyWatchApp {
         let Some(source) = self.active_region else {
             return;
         };
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new(format!("{} · Purchase setup", source.region_label()))
-                                .size(24.0)
-                                .strong()
-                                .color(INK),
-                        );
-                        ui.label(
-                            RichText::new(format!(
-                                "{} · Separate browser session · ARMED targets and checkout use this store",
-                                source.store_label()
-                            ))
-                            .size(11.5)
-                            .color(MUTED),
-                        );
-                    });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let (text, color) = match self.login_status_for(source) {
-                            LoginStatus::Ready => ("● LOGIN READY", GREEN),
-                            LoginStatus::NeedsRecheck => ("◐ LOGIN NEEDS RECHECK", ROSE),
-                            LoginStatus::Unknown => ("○ LOGIN UNKNOWN", RED),
-                        };
-                        ui.label(RichText::new(text).size(11.0).strong().color(color));
-                    });
-                });
-
-                ui.add_space(16.0);
-                Frame::new()
-                    .fill(PANEL)
-                    .stroke(Stroke::new(1.0_f32, BORDER))
-                    .corner_radius(14)
-                    .inner_margin(Margin::same(18))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.vertical(|ui| {
-                                ui.label(
-                                    RichText::new(format!("1 · {} account and purchase browser", source.region_label()))
-                                        .size(15.0)
-                                        .strong()
-                                        .color(INK),
-                                );
-                                let account_hint = match source {
-                                    StoreSource::JapanOnlineStore => {
-                                        "The Japan store uses a separate BABY/Shopify account. Its session stays in your browser profile."
-                                    }
-                                    StoreSource::ChinaLaceRococo => {
-                                        "LaceRococo has its own Shopify Customer Account, separate from the Japan store session."
-                                    }
-                                };
-                                ui.label(RichText::new(account_hint).size(11.0).color(MUTED));
-                            });
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if soft_button(ui, "Verify account page").clicked() {
-                                    let url = shopify::account_url(source);
-                                    if let Err(error) = browser::open_url(self.settings.browser, &url) {
-                                        self.toast = Some((format!("Could not open the account page: {error}"), 0.0));
-                                    }
-                                }
-                                let login_label = match source {
-                                    StoreSource::JapanOnlineStore => "Sign in to Japan store",
-                                    StoreSource::ChinaLaceRococo => "Sign in to China partner store",
-                                };
-                                if ui.add(primary_button(login_label)).clicked() {
-                                    let url = shopify::account_login_url(source);
-                                    match browser::open_url(self.settings.browser, &url) {
-                                        Ok(()) => self.push_purchase_log(format!(
-                                            "Opened the {} sign-in page for {}",
-                                            self.settings.browser.label(),
-                                            source.store_label()
-                                        )),
-                                        Err(error) => {
-                                            self.toast = Some((format!("Could not open the sign-in page: {error}"), 0.0));
-                                        }
-                                    }
-                                }
-                            });
-                        });
-
-                        ui.add_space(12.0);
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("Purchase browser").size(10.5).strong().color(MUTED));
-                            let old_browser = self.settings.browser;
-                            egui::ComboBox::from_id_salt("purchase_browser_choice")
-                                .selected_text(self.settings.browser.label())
-                                .width(150.0)
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut self.settings.browser,
-                                        BrowserChoice::SystemDefault,
-                                        BrowserChoice::SystemDefault.label(),
-                                    );
-                                    if cfg!(target_os = "macos") {
-                                        ui.selectable_value(
-                                            &mut self.settings.browser,
-                                            BrowserChoice::Safari,
-                                            BrowserChoice::Safari.label(),
-                                        );
-                                        ui.selectable_value(
-                                            &mut self.settings.browser,
-                                            BrowserChoice::Chrome,
-                                            BrowserChoice::Chrome.label(),
-                                        );
-                                    }
-                                });
-                            if self.settings.browser != old_browser {
-                                self.invalidate_runtime_logins();
-                                self.japan_login_last_confirmed_at = None;
-                                self.china_login_last_confirmed_at = None;
-                                self.disarm_all();
-                                self.persist();
-                                self.push_purchase_log(format!(
-                                    "Purchase browser changed to {}; confirm both store sessions again",
-                                    self.settings.browser.label()
-                                ));
-                            }
-                            ui.label(
-                                RichText::new("Both stores use this browser, with separate cookies and sessions")
-                                    .size(10.0)
-                                    .color(MUTED),
-                            );
-                        });
-
-                        ui.add_space(12.0);
-                        Frame::new()
-                            .fill(Color32::from_rgb(252, 247, 249))
-                            .corner_radius(10)
-                            .inner_margin(Margin::symmetric(12, 10))
-                            .show(ui, |ui| {
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.label(RichText::new("Store sign-in steps:").size(10.5).strong().color(MUTED));
-                                    chip(ui, source.region_label());
-                                    ui.label(RichText::new("→").color(MUTED));
-                                    chip(ui, "Open sign-in page");
-                                    ui.label(RichText::new("→").color(MUTED));
-                                    chip(ui, "Sign in to store");
-                                    ui.label(RichText::new("→").color(MUTED));
-                                    chip(ui, "Verify account");
-                                    ui.label(RichText::new("→").color(MUTED));
-                                    chip(ui, "Confirm session");
-                                });
-                            });
-
-                        ui.add_space(12.0);
-                        let login_status = self.login_status_for(source);
-                        let (state_text, state_color) = match login_status {
-                            LoginStatus::Ready => ("READY", GREEN),
-                            LoginStatus::NeedsRecheck => ("NEEDS RECHECK", ROSE),
-                            LoginStatus::Unknown => ("UNKNOWN", RED),
-                        };
-                        let current_confirmed = self.login_current_for(source).cloned();
-                        let previous_confirmed = self.login_previous_for(source).cloned();
-                        Frame::new()
-                            .fill(Color32::WHITE)
-                            .stroke(Stroke::new(1.0_f32, BORDER))
-                            .corner_radius(10)
-                            .inner_margin(Margin::symmetric(12, 10))
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.vertical(|ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                RichText::new(format!("{} session status", source.region_label()))
-                                                    .size(11.0)
-                                                    .strong()
-                                                    .color(INK),
-                                            );
-                                            ui.label(
-                                                RichText::new(state_text)
-                                                    .size(10.5)
-                                                    .strong()
-                                                    .color(state_color),
-                                            );
-                                        });
-                                        match login_status {
-                                            LoginStatus::Ready => {
-                                                if let Some(confirmed_at) = current_confirmed.as_ref() {
-                                                    ui.label(
-                                                        RichText::new(format!(
-                                                            "{} · Confirmed this session at {}",
-                                                            self.settings.browser.label(),
-                                                            confirmed_at.format("%Y-%m-%d %H:%M:%S")
-                                                        ))
-                                                        .size(10.2)
-                                                        .color(MUTED),
-                                                    );
-                                                }
-                                            }
-                                            LoginStatus::NeedsRecheck => {
-                                                if let Some(confirmed_at) = previous_confirmed.as_ref() {
-                                                    ui.label(
-                                                        RichText::new(format!(
-                                                            "Last confirmed {}. Open this store account page to verify the session.",
-                                                            confirmed_at.format("%Y-%m-%d %H:%M:%S")
-                                                        ))
-                                                        .size(10.2)
-                                                        .color(MUTED),
-                                                    );
-                                                }
-                                            }
-                                            LoginStatus::Unknown => {
-                                                ui.label(RichText::new("No sign-in confirmation for this store yet.").size(10.2).color(MUTED));
-                                            }
-                                        }
-                                    });
-
-                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        if login_status == LoginStatus::Ready {
-                                            if ui
-                                                .add(
-                                                    egui::Button::new(RichText::new("Clear sign-in confirmation").color(RED))
-                                                        .fill(Color32::WHITE)
-                                                        .stroke(Stroke::new(1.0_f32, RED))
-                                                        .corner_radius(9),
-                                                )
-                                                .clicked()
-                                            {
-                                                self.clear_login_for(source);
-                                                self.disarm_all();
-                                                self.persist();
-                                                self.push_purchase_log(format!(
-                                                    "Cleared {} sign-in confirmation; the browser remains signed in",
-                                                    source.region_label()
-                                                ));
-                                            }
-                                        } else {
-                                            let label = if login_status == LoginStatus::NeedsRecheck {
-                                                "Confirm still signed in"
-                                            } else {
-                                                "I am signed in to this store"
-                                            };
-                                            if ui.add(primary_button(label)).clicked() {
-                                                self.confirm_login_for(source);
-                                                self.persist();
-                                                self.push_purchase_log(format!(
-                                                    "User confirmed: {} is signed in to {}",
-                                                    self.settings.browser.label(),
-                                                    source.store_label()
-                                                ));
-                                                self.toast = Some((format!(
-                                                    "{} sign-in confirmed; targets can now be armed",
-                                                    source.region_label()
-                                                ), 0.0));
-                                            }
-                                        }
-                                    });
-                                });
-                            });
-
-                        ui.add_space(8.0);
-                        ui.label(
-                            RichText::new("Sign-in is confirmed manually for 30 minutes. The app cannot detect browser sign-out. Store confirmations are separate.")
-                                .size(10.0)
-                                .color(MUTED),
-                        );
-                    });
-
-                ui.add_space(14.0);
-                Frame::new()
-                    .fill(PANEL)
-                    .stroke(Stroke::new(1.0_f32, BORDER))
-                    .corner_radius(14)
-                    .inner_margin(Margin::same(18))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.vertical(|ui| {
-                                ui.label(RichText::new("2 · ARMED purchase targets").size(15.0).strong().color(INK));
-                                ui.label(
-                                    RichText::new(format!(
-                                        "ARMED targets wait {} seconds between check rounds; the catalog uses its own schedule.",
-                                        self.settings.armed_poll_seconds
-                                    ))
-                                    .size(11.0)
-                                    .color(MUTED),
-                                );
-                            });
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                let region_armed = self.armed_ids.iter().any(|id| {
-                                    self.watch_items.iter().any(|item| item.id == *id && item.source == source)
-                                });
-                                if region_armed && soft_button(ui, "Disarm all").clicked()
-                                {
-                                    self.disarm_all();
-                                }
-                            });
-                        });
-
-                        ui.add_space(12.0);
-                        let armed_ids = self
-                            .armed_ids
-                            .iter()
-                            .copied()
-                            .filter(|id| self.watch_items.iter().any(|item| item.id == *id && item.source == source))
-                            .collect::<Vec<_>>();
-                        if armed_ids.is_empty() {
-                            ui.label(
-                                RichText::new("No ARMED targets. Set color, size, and price rules in Watchlist, then click Arm target.")
-                                    .size(11.5)
-                                    .color(MUTED),
-                            );
-                        } else {
-                            let mut disarm_id = None;
-                            for id in armed_ids {
-                                let Some(item) = self.watch_items.iter().find(|item| item.id == id) else {
-                                    continue;
-                                };
-                                let title = item.runtime.title.as_deref().unwrap_or(&item.input);
-                                let color_target = if item.variant_filter.trim().is_empty() {
-                                    "Any color".to_owned()
-                                } else {
-                                    item.variant_filter.clone()
-                                };
-                                let size_target = if item.purchase.size_priority.trim().is_empty() {
-                                    "Any size".to_owned()
-                                } else {
-                                    item.purchase.size_priority.clone()
-                                };
-                                let target = format!("{color_target} · {size_target}");
-                                let price = if item.purchase.max_price_yen == 0 {
-                                    "No price limit".to_owned()
-                                } else {
-                                    format!("≤ ¥{}", group_plain_digits(item.purchase.max_price_yen))
-                                };
-                                let buyable = Self::resolve_purchase_variant(item);
-
-                                Frame::new()
-                                    .fill(Color32::from_rgb(252, 247, 249))
-                                    .stroke(Stroke::new(1.0_f32, BORDER))
-                                    .corner_radius(10)
-                                    .inner_margin(Margin::symmetric(12, 10))
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.label(RichText::new("●").color(ROSE));
-                                            ui.vertical(|ui| {
-                                                ui.label(RichText::new(title).size(12.0).strong().color(INK));
-                                                ui.label(
-                                                    RichText::new(format!("{target} · {price}"))
-                                                        .size(10.5)
-                                                        .color(MUTED),
-                                                );
-                                                if let Some(variant) = &buyable {
-                                                    ui.label(
-                                                        RichText::new(format!(
-                                                            "Available now: {} · {}",
-                                                            variant.display_label(),
-                                                            shopify::format_jpy(variant.price_minor)
-                                                        ))
-                                                        .size(10.5)
-                                                        .color(GREEN),
-                                                    );
-                                                } else {
-                                                    ui.label(RichText::new("Waiting for stock that matches your rules").size(10.5).color(MUTED));
-                                                }
-                                            });
-                                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                                if soft_button(ui, "Disarm").clicked() {
-                                                    disarm_id = Some(id);
-                                                }
-                                            });
-                                        });
-                                    });
-                                ui.add_space(7.0);
-                            }
-                            if let Some(id) = disarm_id {
-                                self.disarm_target(id);
-                            }
-                        }
-                    });
-
-                ui.add_space(14.0);
-                Frame::new()
-                    .fill(PANEL)
-                    .stroke(Stroke::new(1.0_f32, BORDER))
-                    .corner_radius(14)
-                    .inner_margin(Margin::same(18))
-                    .show(ui, |ui| {
-                        ui.label(RichText::new("3 · Activity log").size(15.0).strong().color(INK));
-                        ui.label(
-                            RichText::new("Logs contain app actions, without OTPs, cookies, or payment details.")
-                                .size(10.5)
-                                .color(MUTED),
-                        );
-                        ui.add_space(9.0);
-                        if self.purchase_log.is_empty() {
-                            ui.label(RichText::new("No activity yet").size(11.0).color(MUTED));
-                        } else {
-                            for entry in self.purchase_log.iter().take(20) {
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new(entry.at.format("%H:%M:%S").to_string())
-                                            .size(10.0)
-                                            .monospace()
-                                            .color(MUTED),
-                                    );
-                                    ui.label(RichText::new(&entry.text).size(10.8).color(INK));
-                                });
-                            }
-                        }
-                    });
-
+        egui::ScrollArea::vertical().id_salt("purchase_scroll").auto_shrink([false,false]).show(ui, |ui| {
+            section_title(ui,"Ready when you are", "Connect your browser session before arming a piece.");
+            card().show(ui, |ui| {
+                eyebrow(ui,"01 / YOUR ACCOUNT");
                 ui.add_space(10.0);
-                ui.label(
-                    RichText::new("ARMED matches open this store checkout. Complete the final order yourself. Store sign-in and security checks still apply.")
-                        .size(10.5)
-                        .color(MUTED),
-                );
+                ui.label(RichText::new(source.store_label()).size(18.0).strong());
+                ui.add_space(8.0);
+                ui.add(egui::Label::new("Sign in in your purchase browser, open your account page, then confirm the session here.").wrap());
+                ui.add_space(16.0);
+                small_label(ui,"Purchase browser");
+                let old_browser=self.settings.browser;
+                egui::ComboBox::from_id_salt("purchase_browser").selected_text(self.settings.browser.label()).width(220.0).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.settings.browser,BrowserChoice::SystemDefault,"System default");
+                    if cfg!(target_os="macos") {
+                        ui.selectable_value(&mut self.settings.browser,BrowserChoice::Chrome,"Google Chrome");
+                        ui.selectable_value(&mut self.settings.browser,BrowserChoice::Safari,"Safari");
+                    }
+                });
+                if old_browser!=self.settings.browser { self.invalidate_runtime_logins(); self.disarm_all(); self.persist(); }
+                ui.add_space(14.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add(primary_button("Open sign-in page")).clicked() {
+                        if let Err(e)=browser::open_url(self.settings.browser,&shopify::account_login_url(source)) { self.toast=Some((e,0.0)); }
+                    }
+                    if soft_button(ui,"Open account page").clicked() { let _=browser::open_url(self.settings.browser,&shopify::account_url(source)); }
+                });
+                ui.add_space(16.0);
+                if self.login_ready_for(source) {
+                    notice(ui,"Session confirmed for this store",GREEN);
+                    if let Some(at)=self.login_current_for(source) { small_label(ui,&format!("Confirmed {}",at.format("%H:%M:%S"))); }
+                    if soft_button(ui,"Clear confirmation").clicked() { self.clear_login_for(source); self.disarm_all(); self.persist(); }
+                } else {
+                    if self.login_previous_for(source).is_some() { small_label(ui,"Your previous confirmation needs a fresh check."); }
+                    if ui.add(secondary_button("I am signed in to this store")).clicked() { self.confirm_login_for(source); self.persist(); }
+                }
+                ui.add_space(10.0);
+                small_label(ui,"Confirmation lasts 30 minutes. Your password and browser cookies stay in your browser.");
             });
+            ui.add_space(16.0);
+            card().show(ui, |ui| {
+                eyebrow(ui,"02 / ARMED PIECES");
+                ui.add_space(12.0);
+                let targets:Vec<_>=self.watch_items.iter().filter(|w|w.source==source && self.armed_ids.contains(&w.id)).map(|w|(w.id,w.runtime.title.clone().unwrap_or_else(||w.input.clone()))).collect();
+                if targets.is_empty() { ui.label("No targets armed yet. Add your preferences in Watchlist or Friday releases."); }
+                for (id,title) in targets {
+                    ui.add(egui::Label::new(RichText::new(title).strong()).wrap());
+                    if soft_button(ui,"Disarm").clicked() { self.disarm_target(id); }
+                    ui.add_space(8.0);
+                }
+                ui.add_space(8.0);
+                small_label(ui,"A stock match opens the store checkout. You review and complete the final order there.");
+            });
+            ui.add_space(16.0);
+            card().show(ui, |ui| {
+                eyebrow(ui,"03 / RECENT ACTIVITY");
+                ui.add_space(12.0);
+                if self.purchase_log.is_empty() { small_label(ui,"Nothing to report yet."); }
+                for entry in self.purchase_log.iter().take(20) {
+                    small_label(ui,&entry.at.format("%H:%M:%S").to_string());
+                    ui.add(egui::Label::new(&entry.text).wrap());
+                    ui.add_space(10.0);
+                }
+            });
+        });
     }
 
     fn auto_checkout_allowed(&self, id: u64) -> bool {
@@ -2240,231 +1419,132 @@ impl BabyWatchApp {
         let Some(source) = self.active_region else {
             return;
         };
-        if source != StoreSource::JapanOnlineStore {
-            ui.heading("Friday releases · Japan official store");
-            ui.label("This schedule follows the Japan reservation guide. Use product watches for the China channel.");
-            return;
-        }
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.heading("Friday releases · Japan time (JST)");
-            ui.label("Prepare a title, product code, or URL. At opening, match one product, check live variants, and open checkout.");
-            ui.hyperlink_to("Official reservation guide: designated Friday 12:00 to Monday 12:00; check each announcement", "https://store.babyssb.co.jp/pages/guide_reserve");
-            ui.add_space(12.0);
-            let old = self.settings.release_schedule.clone();
-            Frame::new().fill(PANEL).stroke(Stroke::new(1.0_f32, BORDER)).corner_radius(12).inner_margin(Margin::same(16)).show(ui, |ui| {
-                let schedule = &mut self.settings.release_schedule;
-                ui.checkbox(&mut schedule.enabled, "Enable Friday release schedule");
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Every Friday");
-                    ui.add(egui::DragValue::new(&mut schedule.hour).range(0..=23).suffix("h"));
-                    ui.add(egui::DragValue::new(&mut schedule.minute).range(0..=59).suffix("m JST"));
-                    ui.label("Prewarm");
-                    ui.add(egui::DragValue::new(&mut schedule.prewarm_minutes).range(0..=60).suffix("min"));
-                    ui.label("Sale window");
-                    ui.add(egui::DragValue::new(&mut schedule.window_minutes).range(1..=120).suffix("min"));
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Catalog polling during window");
-                    ui.add(egui::DragValue::new(&mut schedule.poll_seconds).range(5..=60).suffix("s"));
-                });
-                let now = Utc::now();
-                let text = if let Some(opening) = schedule.active_slot(now) {
-                    if now < opening { format!("Prewarming · Opens {} JST", opening.format("%m-%d %H:%M")) }
-                    else { "Release window active · Running manually armed rules".into() }
-                } else if let Some(opening) = schedule.next_opening(now) {
-                    let delta = opening.signed_duration_since(now);
-                    format!("Next: {} JST · In {}d {}h {}m", opening.format("%Y-%m-%d %H:%M"), delta.num_days(), delta.num_hours() % 24, delta.num_minutes() % 60)
-                } else { "Invalid schedule".into() };
-                ui.label(RichText::new(text).color(ROSE));
-                ui.label("Prewarm refreshes the catalog only. Keep the app running and computer awake. Confirm browser sign-in within 30 minutes of opening.");
-                ui.label("Restarting, switching stores or browsers, editing rules, or ending the window disarms the affected rules. Arm before each release.");
-            });
-            if old != self.settings.release_schedule {
-                self.disarm_release();
-                self.persist();
-            }
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                if soft_button(ui, "+ Add release target").clicked() {
-                    let id = self.release_rules.iter().map(|r| r.id).max().unwrap_or(0) + 1;
-                    self.release_rules.push(ReleaseRule::new(id, source));
-                    self.persist();
+        egui::ScrollArea::vertical().id_salt("release_scroll").auto_shrink([false,false]).show(ui, |ui| {
+            section_title(ui,"Friday, thoughtfully prepared", "Your release schedule and wish list, in Japan time.");
+            if source!=StoreSource::JapanOnlineStore { notice(ui,"Friday scheduling is available for the Japan store. Use Watchlist for this store.",ROSE); return; }
+            let old=self.settings.release_schedule.clone();
+            card().show(ui, |ui| {
+                eyebrow(ui,"THE NEXT OPENING");
+                ui.add_space(12.0);
+                let now=Utc::now();
+                let schedule=&mut self.settings.release_schedule;
+                let opening=schedule.active_slot(now).or_else(||schedule.next_opening(now));
+                if let Some(opening)=opening {
+                    ui.label(RichText::new(opening.format("Friday, %d %B · %H:%M JST").to_string()).size(24.0).strong().color(INK));
+                    let seconds=opening.signed_duration_since(now).num_seconds();
+                    small_label(ui, &if seconds>0 { format!("{}d {}h {}m to go",seconds/86400,(seconds/3600)%24,(seconds/60)%60) } else { "Release window is open".into() });
                 }
-                if soft_button(ui, "Sign-in and purchase setup →").clicked() { self.page = Page::Purchase; }
-                if soft_button(ui, "Disarm all release rules").clicked() { self.disarm_release(); }
-            });
-            if self.release_rules.is_empty() { ui.label("Add a target and enter a specific title, product code, or URL. Separate title terms with |; all terms must match."); }
-            let mut remove = None;
-            for index in 0..self.release_rules.len() {
-                if self.release_rules[index].source != source { continue; }
-                let id = self.release_rules[index].id;
-                let armed = self.release_armed.contains(&id);
-                let login_ready = self.login_ready_for(source);
-                let schedule_ready = self.settings.release_schedule.enabled && self.settings.release_schedule.validate().is_ok();
-                let mut changed = false;
-                let mut toggle = false;
-                ui.add_space(10.0);
-                Frame::new().fill(PANEL).stroke(Stroke::new(1.0_f32, BORDER)).corner_radius(12).inner_margin(Margin::same(16)).show(ui, |ui| {
-                    let rule = &mut self.release_rules[index];
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("Target #{id} · {}", if armed { "ARMED" } else { "Not armed" })).strong().color(if armed { ROSE } else { MUTED }));
-                        if ui.small_button("Delete").clicked() { remove = Some(id); }
+                ui.add_space(16.0);
+                ui.checkbox(&mut schedule.enabled,"Enable this release schedule");
+                ui.add_space(12.0);
+                ui.columns(3, |columns| {
+                    small_label(&mut columns[0],"Friday opening · JST");
+                    columns[0].horizontal(|ui| {
+                        ui.add(egui::DragValue::new(&mut schedule.hour).range(0..=23).prefix("Hour "));
+                        ui.add(egui::DragValue::new(&mut schedule.minute).range(0..=59).prefix("Min "));
                     });
-                    ui.label("Product URL / code / title terms (| means match all terms)");
-                    changed |= ui.add(egui::TextEdit::singleline(&mut rule.product_hint).desired_width(f32::INFINITY).hint_text("Example: Series name | Jumper Skirt, or a specific product URL")).changed();
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label("Color priority");
-                        changed |= ui.add(egui::TextEdit::singleline(&mut rule.color_priority).desired_width(200.0).hint_text("Pink | Black; blank for any")).changed();
-                        ui.label("Size priority");
-                        changed |= ui.add(egui::TextEdit::singleline(&mut rule.purchase.size_priority).desired_width(120.0).hint_text("M | S")).changed();
-                    });
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label("Maximum JPY price (0 = no limit)");
-                        changed |= ui.add(egui::DragValue::new(&mut rule.purchase.max_price_yen).range(0..=1_000_000)).changed();
-                        ui.label("Quantity");
-                        changed |= ui.add(egui::DragValue::new(&mut rule.purchase.quantity).range(1..=3)).changed();
-                        changed |= ui.checkbox(&mut rule.purchase.auto_open_checkout, "Open checkout automatically on match").changed();
-                    });
-                    let count = self.catalog.iter().filter(|p| rule.matches(source, p)).count();
-                    ui.label(format!("{count} catalog matches · Only a unique match can run"));
-                    if let Some(status) = self.release_status.get(&id) { ui.label(RichText::new(status).color(ROSE)); }
-                    if !login_ready { ui.label("Confirm Japan store sign-in in Purchase setup first (valid for 30 minutes)."); }
-                    if !schedule_ready { ui.label("Enable and configure the release schedule first."); }
-                    let valid_hint = rule.product_hint.split('|').any(|term| !term.trim().is_empty());
-                    if ui.add_enabled(armed || (login_ready && schedule_ready && valid_hint), primary_button(if armed { "Disarm this release" } else { "Arm this release" })).clicked() { toggle = true; }
+                    small_label(&mut columns[1],"Prewarm");
+                    columns[1].add(egui::DragValue::new(&mut schedule.prewarm_minutes).range(0..=60).suffix(" min"));
+                    small_label(&mut columns[2],"After opening");
+                    columns[2].add(egui::DragValue::new(&mut schedule.window_minutes).range(1..=120).suffix(" min"));
                 });
-                if changed {
-                    self.disarm_release_rule(id);
-                    self.persist();
-                } else if toggle {
+                ui.add_space(12.0);
+                small_label(ui,"Catalog interval during the window");
+                ui.add(egui::DragValue::new(&mut schedule.poll_seconds).range(5..=60).suffix(" seconds"));
+                ui.add_space(12.0);
+                small_label(ui,"Prewarm refreshes the catalog only. Keep the app running and your computer awake.");
+                ui.hyperlink_to("View the official reservation guide", "https://store.babyssb.co.jp/pages/guide_reserve");
+            });
+            if old!=self.settings.release_schedule { self.disarm_release(); self.persist(); }
+            ui.add_space(18.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui.add(primary_button("+ Add a release target")).clicked() {
+                    let id=self.release_rules.iter().map(|r|r.id).max().unwrap_or(0)+1;
+                    self.release_rules.push(ReleaseRule::new(id,source)); self.persist();
+                }
+                if soft_button(ui,"Sign-in setup").clicked() { self.page=Page::Purchase; }
+                if !self.release_armed.is_empty() && soft_button(ui,"Disarm all").clicked() { self.disarm_release(); }
+            });
+            ui.add_space(16.0);
+            if self.release_rules.is_empty() { empty_state(ui,"What is on your wish list?", "Add a product URL, code, or a few specific title terms to prepare your first target."); }
+            let mut remove=None;
+            for index in 0..self.release_rules.len() {
+                if self.release_rules[index].source!=source { continue; }
+                let id=self.release_rules[index].id;
+                let armed=self.release_armed.contains(&id);
+                let ready=self.login_ready_for(source) && self.settings.release_schedule.enabled && self.settings.release_schedule.validate().is_ok();
+                let mut changed=false; let mut toggle=false;
+                card().show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    eyebrow(ui,&format!("WISH LIST / {:02}", index+1));
+                    ui.add_space(10.0);
+                    let rule=&mut self.release_rules[index];
+                    changed |= form_field(ui,"Product URL, code, or title terms",&mut rule.product_hint,"Series name | Jumper Skirt");
+                    small_label(ui,"Use | between title terms that must all match.");
+                    ui.add_space(12.0);
+                    changed |= purchase_fields(ui,&mut rule.color_priority,&mut rule.purchase);
+                    ui.add_space(12.0);
+                    let matches=self.catalog.iter().filter(|p|rule.matches(source,p)).count();
+                    small_label(ui,&format!("{matches} matching products · A unique match is required"));
+                    if let Some(status)=self.release_status.get(&id) { notice(ui,status,ROSE); }
+                    if !ready { small_label(ui,"Enable the schedule and confirm sign-in before arming."); }
+                    let hint=rule.product_hint.split('|').any(|s|!s.trim().is_empty());
+                    ui.add_space(12.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.add_enabled(armed || (ready&&hint),primary_button(if armed { "Disarm release" } else { "Arm this release" })).clicked() { toggle=true; }
+                        if soft_button(ui,"Remove").clicked() { remove=Some(id); }
+                    });
+                });
+                if changed { self.disarm_release_rule(id); self.persist(); }
+                else if toggle {
                     if armed { self.disarm_release_rule(id); }
                     else {
-                        self.release_completed.remove(&id);
-                        self.release_armed.insert(id);
-                        let now = Utc::now();
-                        let schedule = &self.settings.release_schedule;
-                        self.release_run = schedule.active_slot(now).or_else(|| schedule.next_opening(now)).map(|opening| opening.timestamp());
-                        self.release_status.insert(id, "Armed; waiting for the release window and a unique product match".into());
+                        self.release_completed.remove(&id); self.release_armed.insert(id);
+                        let now=Utc::now(); let schedule=&self.settings.release_schedule;
+                        self.release_run=schedule.active_slot(now).or_else(||schedule.next_opening(now)).map(|t|t.timestamp());
+                        self.release_status.insert(id,"Armed · Waiting for opening and a unique match".into());
                         self.push_purchase_log(format!("Friday release target #{id} armed"));
                     }
                 }
+                ui.add_space(16.0);
             }
-            if let Some(id) = remove {
-                self.disarm_release_rule(id);
-                self.release_rules.retain(|rule| rule.id != id);
-                self.release_status.remove(&id);
-                self.persist();
-            }
+            if let Some(id)=remove { self.disarm_release_rule(id); self.release_rules.retain(|r|r.id!=id); self.release_status.remove(&id); self.persist(); }
         });
     }
 
     fn region_gate(&mut self, ctx: &egui::Context) {
-        let mut chosen = None;
-        egui::CentralPanel::default()
-            .frame(Frame::new().fill(BG).inner_margin(Margin::same(32)))
-            .show(ctx, |ui| {
-                ui.add_space(32.0);
+        let mut selected = None;
+        egui::CentralPanel::default().frame(Frame::new().fill(BG).stroke(Stroke::NONE).inner_margin(Margin::same(32))).show(ctx, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.add_space(40.0);
                 ui.vertical_centered(|ui| {
-                    ui.label(
-                        RichText::new("BABY WATCH")
-                            .font(FontId::proportional(30.0))
-                            .strong()
-                            .color(INK),
-                    );
-                    ui.label(
-                        RichText::new("Choose a store · Catalog, stock, account session, and checkout are scoped to your selection")
-                            .size(12.5)
-                            .color(MUTED),
-                    );
-                });
-                ui.add_space(26.0);
-
-                ui.columns(2, |columns| {
-                    Frame::new()
-                        .fill(PANEL)
-                        .stroke(Stroke::new(1.0_f32, BORDER))
-                        .corner_radius(16)
-                        .inner_margin(Margin::same(22))
-                        .show(&mut columns[0], |ui| {
-                            ui.label(RichText::new("JP  Japan").size(11.0).strong().color(ROSE));
-                            ui.add_space(5.0);
-                            ui.label(
-                                RichText::new("BABY Japan Official Online Store")
-                                    .size(19.0)
-                                    .strong()
-                                    .color(INK),
-                            );
-                            ui.label(RichText::new("store.babyssb.co.jp").size(11.0).monospace().color(MUTED));
-                            ui.add_space(12.0);
-                            ui.label(RichText::new("• Japan official Shopify catalog and stock").size(11.5).color(INK));
-                            ui.label(RichText::new("• Separate Japan account and browser session").size(11.5).color(INK));
-                            ui.label(RichText::new("• JPY prices and Japan store checkout").size(11.5).color(INK));
-                            ui.add_space(18.0);
-                            if ui
-                                .add_sized(
-                                    [ui.available_width(), 42.0],
-                                    primary_button("Monitor Japan store →"),
-                                )
-                                .clicked()
-                            {
-                                chosen = Some(StoreSource::JapanOnlineStore);
-                            }
-                        });
-
-                    Frame::new()
-                        .fill(PANEL)
-                        .stroke(Stroke::new(1.0_f32, BORDER))
-                        .corner_radius(16)
-                        .inner_margin(Margin::same(22))
-                        .show(&mut columns[1], |ui| {
-                            ui.label(RichText::new("CN  Mainland China").size(11.0).strong().color(ROSE));
-                            ui.add_space(5.0);
-                            ui.label(
-                                RichText::new("LaceRococo · China Partner Store")
-                                    .size(19.0)
-                                    .strong()
-                                    .color(INK),
-                            );
-                            ui.label(RichText::new("www.lacerococo.com").size(11.0).monospace().color(MUTED));
-                            ui.add_space(12.0);
-                            ui.label(RichText::new("• China-facing store operated by Yakumo").size(11.5).color(INK));
-                            ui.label(RichText::new("• Separate Shopify customer account and session").size(11.5).color(INK));
-                            ui.label(RichText::new("• BABY / A/P products from this store only").size(11.5).color(INK));
-                            ui.add_space(18.0);
-                            if ui
-                                .add_sized(
-                                    [ui.available_width(), 42.0],
-                                    primary_button("Monitor China partner store →"),
-                                )
-                                .clicked()
-                            {
-                                chosen = Some(StoreSource::ChinaLaceRococo);
-                            }
-                        });
-                });
-
-                ui.add_space(18.0);
-                Frame::new()
-                    .fill(Color32::from_rgb(255, 248, 249))
-                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(236, 206, 210)))
-                    .corner_radius(11)
-                    .inner_margin(Margin::symmetric(14, 11))
-                    .show(ui, |ui| {
-                        ui.label(
-                            RichText::new("Store separation")
-                                .size(11.0)
-                                .strong()
-                                .color(RED),
-                        );
-                        ui.label(
-                            RichText::new("LaceRococo is a separate Yakumo partner store with its own account session. BABY has identified babyzg.is / babyssb.is as impersonation sites; this app does not connect to them.")
-                                .size(10.7)
-                                .color(MUTED),
-                        );
+                    ui.set_max_width(640.0);
+                    eyebrow(ui,"A LITTLE CLOSER TO YOUR FAVORITES");
+                    ui.add_space(18.0);
+                    ui.label(RichText::new("BABY Watch").size(44.0).strong().color(INK));
+                    ui.add_space(10.0);
+                    ui.add(egui::Label::new(RichText::new("A quiet place to browse, watch, and prepare for your next release.").size(15.0).color(MUTED)).wrap());
+                    ui.add_space(32.0);
+                    card().show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        eyebrow(ui,"JAPAN / OFFICIAL STORE"); ui.add_space(12.0);
+                        ui.label(RichText::new("BABY & ALICE and the PIRATES").size(22.0).strong());
+                        ui.add_space(8.0);
+                        small_label(ui,"The official Japan collection, live stock, and Friday releases.");
+                        ui.add_space(18.0);
+                        if ui.add(primary_button("Explore the Japan store →")).clicked() { selected=Some(StoreSource::JapanOnlineStore); }
                     });
+                    ui.add_space(18.0);
+                    ui.collapsing("Looking for the China partner store?", |ui| {
+                        ui.add(egui::Label::new("LaceRococo uses a separate catalog and account session.").wrap());
+                        if soft_button(ui,"Open LaceRococo").clicked() { selected=Some(StoreSource::ChinaLaceRococo); }
+                    });
+                    ui.add_space(30.0);
+                    small_label(ui,"Your preferences stay on this computer.");
+                });
             });
-
-        if let Some(source) = chosen {
+        });
+        if let Some(source) = selected {
             self.select_region(source);
         }
     }
@@ -2487,11 +1567,17 @@ impl BabyWatchApp {
             .anchor(egui::Align2::RIGHT_BOTTOM, Vec2::new(-24.0, -24.0))
             .show(ctx, |ui| {
                 Frame::new()
-                    .fill(Color32::from_rgb(49, 45, 47))
+                    .fill(ROSE)
                     .corner_radius(11)
                     .inner_margin(Margin::symmetric(14, 10))
                     .show(ui, |ui| {
-                        ui.label(RichText::new(message).size(12.5).color(Color32::WHITE));
+                        ui.set_max_width(340.0);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(message).size(12.5).color(Color32::WHITE),
+                            )
+                            .wrap(),
+                        );
                     });
             });
     }
@@ -2515,22 +1601,22 @@ impl eframe::App for BabyWatchApp {
                 Frame::new()
                     .fill(PANEL)
                     .inner_margin(Margin::symmetric(22, 13))
-                    .stroke(Stroke::new(1.0_f32, BORDER)),
+                    .stroke(Stroke::NONE),
             )
             .show(ctx, |ui| self.top_bar(ui));
 
         egui::SidePanel::left("side")
             .resizable(false)
-            .exact_width(215.0)
+            .exact_width(220.0)
             .frame(
                 Frame::new()
-                    .fill(Color32::from_rgb(244, 238, 241))
+                    .fill(Color32::from_rgb(252, 250, 249))
                     .inner_margin(Margin::same(18)),
             )
             .show(ctx, |ui| self.sidebar(ui));
 
         egui::CentralPanel::default()
-            .frame(Frame::new().fill(BG).inner_margin(Margin::same(22)))
+            .frame(Frame::new().fill(BG).inner_margin(Margin::same(28)))
             .show(ctx, |ui| match self.page {
                 Page::Catalog => self.catalog_page(ui),
                 Page::Watchlist => self.watchlist_page(ui),
@@ -2542,6 +1628,10 @@ impl eframe::App for BabyWatchApp {
         ctx.request_repaint_after(std::time::Duration::from_millis(250));
     }
 
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [247.0 / 255.0, 245.0 / 255.0, 243.0 / 255.0, 1.0]
+    }
+
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.persist();
         let _ = self.command_tx.send(MonitorCommand::Stop);
@@ -2549,46 +1639,163 @@ impl eframe::App for BabyWatchApp {
 }
 
 fn configure_style(ctx: &egui::Context) {
+    ctx.set_theme(egui::Theme::Light);
     let mut style = (*ctx.style()).clone();
     style.visuals = egui::Visuals::light();
+    style.wrap_mode = Some(egui::TextWrapMode::Wrap);
+    style.visuals.override_text_color = Some(INK);
     style.visuals.panel_fill = BG;
     style.visuals.window_fill = PANEL;
-    style.visuals.extreme_bg_color = Color32::WHITE;
-    style.visuals.widgets.inactive.bg_fill = Color32::WHITE;
-    style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER);
-    style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(250, 239, 244);
+    style.visuals.window_stroke = Stroke::new(1.0_f32, BORDER);
+    style.visuals.window_shadow = egui::epaint::Shadow::NONE;
+    style.visuals.popup_shadow = egui::epaint::Shadow::NONE;
+    style.visuals.window_corner_radius = CornerRadius::same(14);
+    style.visuals.menu_corner_radius = CornerRadius::same(10);
+    style.visuals.extreme_bg_color = Color32::from_rgb(250, 248, 249);
+    style.visuals.faint_bg_color = ROSE_SOFT;
+    style.visuals.selection.bg_fill = ROSE_SOFT;
+    style.visuals.selection.stroke = Stroke::new(1.0_f32, ROSE);
+    style.visuals.hyperlink_color = ROSE;
+    for widget in [
+        &mut style.visuals.widgets.noninteractive,
+        &mut style.visuals.widgets.inactive,
+        &mut style.visuals.widgets.hovered,
+        &mut style.visuals.widgets.active,
+        &mut style.visuals.widgets.open,
+    ] {
+        widget.bg_fill = Color32::from_rgb(250, 248, 249);
+        widget.weak_bg_fill = Color32::from_rgb(250, 248, 249);
+        widget.bg_stroke = Stroke::new(1.0_f32, BORDER);
+        widget.fg_stroke = Stroke::new(1.0_f32, INK);
+        widget.corner_radius = CornerRadius::same(8);
+        widget.expansion = 0.0;
+    }
+    style.visuals.widgets.hovered.bg_fill = ROSE_SOFT;
+    style.visuals.widgets.hovered.weak_bg_fill = ROSE_SOFT;
     style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, ROSE);
-    style.visuals.widgets.active.bg_fill = ROSE_SOFT;
     style.visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, ROSE);
-    style.spacing.item_spacing = Vec2::new(8.0, 7.0);
-    style.spacing.button_padding = Vec2::new(10.0, 7.0);
+    style.visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, ROSE);
+    style.spacing.item_spacing = Vec2::new(10.0, 8.0);
+    style.spacing.button_padding = Vec2::new(14.0, 9.0);
+    style.spacing.interact_size = Vec2::new(32.0, 34.0);
+    style.spacing.slider_width = 110.0;
+    style
+        .text_styles
+        .insert(egui::TextStyle::Body, FontId::proportional(13.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Button, FontId::proportional(13.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Small, FontId::proportional(11.0));
     ctx.set_style(style);
 }
 
+fn card() -> Frame {
+    Frame::new()
+        .fill(PANEL)
+        .stroke(Stroke::NONE)
+        .corner_radius(16)
+        .inner_margin(Margin::same(20))
+}
+fn eyebrow(ui: &mut egui::Ui, text: &str) {
+    ui.label(RichText::new(text).size(10.0).strong().color(MUTED));
+}
+fn small_label(ui: &mut egui::Ui, text: &str) {
+    ui.add(egui::Label::new(RichText::new(text).size(12.0).color(MUTED)).wrap());
+}
+fn section_title(ui: &mut egui::Ui, title: &str, subtitle: &str) {
+    ui.add(egui::Label::new(RichText::new(title).size(29.0).strong().color(INK)).wrap());
+    ui.add_space(5.0);
+    small_label(ui, subtitle);
+    ui.add_space(22.0);
+}
+fn notice(ui: &mut egui::Ui, text: &str, color: Color32) {
+    ui.add_space(8.0);
+    ui.add(egui::Label::new(RichText::new(text).size(12.0).color(color)).wrap());
+    ui.add_space(4.0);
+}
+fn empty_state(ui: &mut egui::Ui, title: &str, description: &str) {
+    card().show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        ui.add_space(22.0);
+        ui.add(egui::Label::new(RichText::new(title).size(20.0).strong()).wrap());
+        ui.add_space(8.0);
+        small_label(ui, description);
+        ui.add_space(22.0);
+    });
+}
+fn form_field(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str) -> bool {
+    small_label(ui, label);
+    ui.add(
+        egui::TextEdit::singleline(value)
+            .desired_width(ui.available_width())
+            .hint_text(hint)
+            .margin(Vec2::new(10.0, 10.0)),
+    )
+    .changed()
+}
+fn purchase_fields(ui: &mut egui::Ui, color: &mut String, rule: &mut PurchaseRule) -> bool {
+    let mut changed = false;
+    ui.columns(2, |columns| {
+        changed |= form_field(&mut columns[0], "Color priority", color, "Pink | Black");
+        changed |= form_field(
+            &mut columns[1],
+            "Size priority",
+            &mut rule.size_priority,
+            "M | S",
+        );
+    });
+    ui.add_space(10.0);
+    ui.columns(2, |columns| {
+        small_label(&mut columns[0], "Maximum price · JPY (0 = any)");
+        changed |= columns[0]
+            .add(
+                egui::DragValue::new(&mut rule.max_price_yen)
+                    .range(0..=1_000_000)
+                    .speed(100),
+            )
+            .changed();
+        small_label(&mut columns[1], "Quantity");
+        changed |= columns[1]
+            .add(egui::DragValue::new(&mut rule.quantity).range(1..=3))
+            .changed();
+    });
+    ui.add_space(10.0);
+    changed |= ui
+        .checkbox(
+            &mut rule.auto_open_checkout,
+            "Open checkout automatically on a match",
+        )
+        .changed();
+    changed
+}
 fn primary_button(text: &str) -> egui::Button<'_> {
-    egui::Button::new(RichText::new(text).color(Color32::WHITE).strong())
+    egui::Button::new(RichText::new(text).color(Color32::WHITE))
         .fill(ROSE)
         .stroke(Stroke::NONE)
-        .corner_radius(CornerRadius::same(9))
-        .min_size(Vec2::new(88.0, 34.0))
+        .corner_radius(9)
+        .wrap()
+        .min_size(Vec2::new(90.0, 38.0))
 }
-
+fn secondary_button(text: &str) -> egui::Button<'_> {
+    egui::Button::new(RichText::new(text).color(INK))
+        .fill(Color32::from_rgb(246, 242, 244))
+        .stroke(Stroke::NONE)
+        .corner_radius(9)
+        .wrap()
+        .min_size(Vec2::new(70.0, 38.0))
+}
 fn soft_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    ui.add(
-        egui::Button::new(RichText::new(text).color(INK))
-            .fill(Color32::WHITE)
-            .stroke(Stroke::new(1.0_f32, BORDER))
-            .corner_radius(9),
-    )
+    ui.add(secondary_button(text))
 }
-
 fn nav_button(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
     ui.add_sized(
-        [ui.available_width(), 36.0],
+        [ui.available_width(), 42.0],
         egui::Button::new(
             RichText::new(text)
-                .color(if selected { ROSE } else { INK })
-                .strong(),
+                .color(if selected { ROSE } else { MUTED })
+                .size(13.0),
         )
         .fill(if selected {
             ROSE_SOFT
@@ -2596,57 +1803,63 @@ fn nav_button(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
             Color32::TRANSPARENT
         })
         .stroke(Stroke::NONE)
-        .corner_radius(9),
+        .corner_radius(10),
     )
 }
-
+fn sidebar_count(ui: &mut egui::Ui, label: &str, count: usize) {
+    ui.horizontal(|ui| {
+        small_label(ui, label);
+        let value = count.to_string();
+        let width = ui.fonts(|fonts| {
+            fonts
+                .layout_no_wrap(value.clone(), FontId::proportional(13.0), INK)
+                .size()
+                .x
+        });
+        ui.add_space((ui.available_width() - width - 10.0).max(0.0));
+        ui.label(RichText::new(value).color(INK).strong());
+    });
+}
 fn chip(ui: &mut egui::Ui, text: &str) {
-    Frame::new()
-        .fill(Color32::from_rgb(246, 240, 243))
-        .corner_radius(7)
-        .inner_margin(Margin::symmetric(7, 4))
-        .show(ui, |ui| {
-            ui.label(RichText::new(text).size(10.5).color(MUTED));
-        });
+    ui.add(
+        egui::Button::new(RichText::new(text).size(11.0).color(ROSE))
+            .fill(ROSE_SOFT)
+            .stroke(Stroke::NONE)
+            .corner_radius(6)
+            .wrap_mode(egui::TextWrapMode::Extend)
+            .sense(egui::Sense::hover()),
+    );
 }
-
-fn color_stock_chip(ui: &mut egui::Ui, color_name: &str, available: bool) {
-    let text = if available {
-        format!("● {color_name}")
+fn color_stock_chip(ui: &mut egui::Ui, name: &str, available: bool) {
+    // A single measured widget wraps as a unit. A nested Frame with wrapped text
+    // can be squeezed to the final few pixels of a row and render one letter per line.
+    let name = if name.chars().count() > 38 {
+        format!("{}…", name.chars().take(37).collect::<String>())
     } else {
-        format!("○ {color_name}")
+        name.to_owned()
     };
-    Frame::new()
+    ui.add(
+        egui::Button::new(
+            RichText::new(format!("{} {name}", if available { "●" } else { "○" }))
+                .size(11.0)
+                .color(if available { GREEN } else { MUTED }),
+        )
         .fill(if available {
-            Color32::from_rgb(239, 248, 244)
+            Color32::from_rgb(237, 245, 239)
         } else {
-            Color32::from_rgb(247, 243, 245)
+            Color32::from_rgb(246, 243, 244)
         })
-        .stroke(Stroke::new(
-            1.0_f32,
-            if available {
-                Color32::from_rgb(190, 224, 208)
-            } else {
-                BORDER
-            },
-        ))
-        .corner_radius(7)
-        .inner_margin(Margin::symmetric(7, 4))
-        .show(ui, |ui| {
-            ui.label(
-                RichText::new(text)
-                    .size(10.5)
-                    .color(if available { GREEN } else { MUTED }),
-            );
-        });
+        .stroke(Stroke::NONE)
+        .corner_radius(6)
+        .wrap_mode(egui::TextWrapMode::Extend)
+        .sense(egui::Sense::hover()),
+    );
 }
-
 fn product_thumbnail(ui: &mut egui::Ui, texture: Option<&egui::TextureHandle>, edge: f32) {
     Frame::new()
-        .fill(Color32::WHITE)
-        .stroke(Stroke::new(1.0_f32, BORDER))
+        .fill(Color32::from_rgb(249, 247, 246))
+        .stroke(Stroke::NONE)
         .corner_radius(10)
-        .inner_margin(Margin::same(3))
         .show(ui, |ui| {
             ui.allocate_ui_with_layout(
                 Vec2::splat(edge),
@@ -2654,49 +1867,12 @@ fn product_thumbnail(ui: &mut egui::Ui, texture: Option<&egui::TextureHandle>, e
                 |ui| {
                     if let Some(texture) = texture {
                         let source = texture.size_vec2();
-                        let scale = if source.x > 0.0 && source.y > 0.0 {
-                            (edge / source.x).min(edge / source.y)
-                        } else {
-                            1.0
-                        };
-                        let size = source * scale;
-                        ui.add(egui::Image::new((texture.id(), size)));
+                        let scale = (edge / source.x.max(1.0)).min(edge / source.y.max(1.0));
+                        ui.add(egui::Image::new((texture.id(), source * scale)));
                     } else {
-                        ui.label(RichText::new("♡").size(24.0).color(ROSE_SOFT));
+                        ui.label(RichText::new("♡").size(30.0).color(ROSE));
                     }
                 },
             );
         });
-}
-
-fn group_plain_digits(value: u64) -> String {
-    let raw = value.to_string();
-    let mut reversed = String::with_capacity(raw.len() + raw.len() / 3);
-    for (index, ch) in raw.chars().rev().enumerate() {
-        if index > 0 && index % 3 == 0 {
-            reversed.push(',');
-        }
-        reversed.push(ch);
-    }
-    reversed.chars().rev().collect()
-}
-
-fn stat(ui: &mut egui::Ui, label: &str, value: String, hint: &str) {
-    Frame::new()
-        .fill(Color32::from_rgb(250, 246, 248))
-        .stroke(Stroke::new(1.0_f32, BORDER))
-        .corner_radius(10)
-        .inner_margin(Margin::same(10))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(RichText::new(label).size(10.5).color(MUTED));
-                    ui.label(RichText::new(value).size(18.0).strong().color(INK));
-                });
-                ui.with_layout(Layout::right_to_left(Align::BOTTOM), |ui| {
-                    ui.label(RichText::new(hint).size(9.5).color(MUTED));
-                });
-            });
-        });
-    ui.add_space(7.0);
 }
